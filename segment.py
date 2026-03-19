@@ -18,6 +18,9 @@ import torch.nn.functional as F
 from PIL import Image
 from scipy import ndimage
 
+# Workaround: cuDNN conv3d fails on some driver/hardware combos (V100 + PyTorch 2.7)
+torch.backends.cudnn.enabled = False
+
 from config import (
     DEFAULT_DEVICE,
     DEFAULT_MODEL_ID,
@@ -114,19 +117,15 @@ class Prithvi2Segmenter(nn.Module):
         torch.Tensor
             ``(B, 1, H, W)`` probabilities in [0, 1].
         """
-        # Encoder expects (B, C, T, H, W)
-        x5d = x.unsqueeze(2)
+        # forward_features returns list of features from each block;
+        # last element is the final norm'd output. Includes cls token at pos 0.
+        features = self.encoder.forward_features(x)
+        latent = features[-1]
 
-        # We need encoder features, not full MAE reconstruction.
-        # Use the encoder portion only: patch_embed → blocks → norm
-        # The PrithviMAE.forward_encoder returns (latent, mask, ids_restore).
-        # We call with mask_ratio=0 to keep all tokens visible.
-        latent, _, _ = self.encoder.forward_encoder(x5d, mask_ratio=0.0)
-
-        # latent may include a cls token at position 0 — detect and strip it
+        # Strip cls token (position 0) to keep only spatial tokens
         expected_tokens = (x.shape[2] // 14) * (x.shape[3] // 14)
         if latent.shape[1] > expected_tokens:
-            latent = latent[:, -expected_tokens:]  # keep spatial tokens only
+            latent = latent[:, -expected_tokens:]
 
         logits = self.head(latent, target_h=x.shape[2], target_w=x.shape[3])
         return torch.sigmoid(logits)

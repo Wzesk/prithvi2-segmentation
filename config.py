@@ -84,6 +84,11 @@ PRITHVI_INDICES_FROM_7BAND = [0, 1, 2, 4, 5, 6]  # skip B08 (index 3)
 TIFF_6BAND_ORDER = ["B02", "B03", "B04", "B08", "B8A", "B11"]
 PRITHVI_INDICES_FROM_6BAND = [0, 1, 2, 4, 5]  # only 5 bands — cannot fill B12
 
+# Prithvi2 training dataset: TIFFs already contain exactly the 6 Prithvi bands
+PRITHVI2_DATASET_BANDS = ["B02", "B03", "B04", "B8A", "B11", "B12"]
+PRITHVI2_DATASET_DIR = "/home/walter_littor_al/seg-training/prithvi2_dataset"
+PRITHVI2_INDICES_DIRECT = [0, 1, 2, 3, 4, 5]  # all 6 bands map directly
+
 # ---------------------------------------------------------------------------
 # Normalization constants (HLS reflectance units, ×10 000 scale)
 # From the model's config.json pretrained_cfg section.

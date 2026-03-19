@@ -27,6 +27,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 
+# Workaround: cuDNN conv3d fails on some driver/hardware combos (V100 + PyTorch 2.7)
+torch.backends.cudnn.enabled = False
+
 from config import (
     DEFAULT_MODEL_ID,
     DEFAULT_DEVICE,
@@ -49,13 +52,17 @@ logger = logging.getLogger(__name__)
 class ShorelineSegDataset(Dataset):
     """Paired multispectral patches ↔ binary mask patches.
 
-    Directory layout expected per site:
+    Supports two directory layouts:
+
+    **Pipeline sites** (default, ``mode="sites"``):
         site_dir/
             TARGETS/          ← multispectral GeoTIFFs (6 or 7 band)
             MASK/             ← binary PNGs (land=255, water=0)
 
-    Masks are at a potentially different resolution (upsampled) so they are
-    downscaled to match the TIF spatial dimensions before patch extraction.
+    **Prithvi2 dataset** (``mode="prithvi2_dataset"``):
+        dataset_dir/
+            tiffs/{split}/    ← 6-band GeoTIFFs (already Prithvi bands)
+            masks/{split}/    ← binary TIFFs (1=land, 0=water)
     """
 
     def __init__(
@@ -65,17 +72,76 @@ class ShorelineSegDataset(Dataset):
         overlap: int = DEFAULT_PATCH_OVERLAP,
         tiff_subdir: str = "TARGETS",
         mask_subdir: str = "MASK",
+        mode: str = "sites",
+        split: str = "train",
     ):
         self.patch_size = patch_size
         self.overlap = overlap
+        self.mode = mode
         self.samples: List[Tuple[np.ndarray, np.ndarray]] = []
 
-        for site in site_dirs:
-            self._load_site(site, tiff_subdir, mask_subdir)
+        if mode == "prithvi2_dataset":
+            for ds_dir in site_dirs:
+                self._load_prithvi2_dataset(ds_dir, split)
+        else:
+            for site in site_dirs:
+                self._load_site(site, tiff_subdir, mask_subdir)
 
         logger.info(
-            "Dataset: %d patch pairs from %d sites", len(self.samples), len(site_dirs)
+            "Dataset: %d patch pairs from %d source(s) (mode=%s)",
+            len(self.samples), len(site_dirs), mode,
         )
+
+    # ── Prithvi2 dataset loader ───────────────────────────────────────
+
+    def _load_prithvi2_dataset(self, dataset_dir: str, split: str):
+        """Load pre-built prithvi2_dataset with 6-band TIFFs + mask TIFFs."""
+        import rasterio as _rio
+
+        tiff_dir = os.path.join(dataset_dir, "tiffs", split)
+        mask_dir = os.path.join(dataset_dir, "masks", split)
+        if not os.path.isdir(tiff_dir) or not os.path.isdir(mask_dir):
+            logger.warning("Missing tiffs/%s or masks/%s in %s — skipping", split, split, dataset_dir)
+            return
+
+        tiff_stems = {
+            os.path.splitext(f)[0]: os.path.join(tiff_dir, f)
+            for f in os.listdir(tiff_dir) if f.endswith(".tif")
+        }
+        mask_stems = {
+            os.path.splitext(f)[0]: os.path.join(mask_dir, f)
+            for f in os.listdir(mask_dir) if f.endswith(".tif")
+        }
+
+        matched = 0
+        for stem, tpath in tiff_stems.items():
+            mpath = mask_stems.get(stem)
+            if mpath is None:
+                continue
+            try:
+                with _rio.open(tpath) as src:
+                    data = src.read().astype(np.float32)  # (6, H, W)
+                with _rio.open(mpath) as src:
+                    mask = src.read(1).astype(np.float32)  # (H, W), 0 or 1
+
+                # Normalize using Prithvi stats (direct — bands already ordered)
+                normed = normalize(data)
+
+                spec_patches, _ = tile_image(normed, self.patch_size, self.overlap)
+                mask_3d = mask[np.newaxis, :, :]
+                mask_patches, _ = tile_image(mask_3d, self.patch_size, self.overlap)
+
+                for sp, mp in zip(spec_patches, mask_patches):
+                    land_frac = mp.mean()
+                    if 0.02 < land_frac < 0.98:
+                        self.samples.append((sp, mp[0]))
+                matched += 1
+            except Exception as exc:
+                logger.debug("Skipping %s: %s", stem, exc)
+
+        logger.info("Prithvi2 dataset %s/%s: %d matched pairs", dataset_dir, split, matched)
+
+    # ── Pipeline site loader ──────────────────────────────────────────
 
     def _load_site(self, site_dir: str, tiff_sub: str, mask_sub: str):
         tiff_dir = os.path.join(site_dir, tiff_sub)
@@ -257,9 +323,9 @@ def train(
             mask = mask.to(dev).unsqueeze(1)  # (B, 1, H, W)
 
             # Forward through frozen encoder + trainable head
-            x5d = spec.unsqueeze(2)  # (B, C, 1, H, W)
             with torch.no_grad():
-                latent, _, _ = segmenter.encoder.forward_encoder(x5d, mask_ratio=0.0)
+                features = segmenter.encoder.forward_features(spec)
+                latent = features[-1]
             expected_tokens = (spec.shape[2] // 14) * (spec.shape[3] // 14)
             if latent.shape[1] > expected_tokens:
                 latent = latent[:, -expected_tokens:]
@@ -288,8 +354,8 @@ def train(
                 spec = spec.to(dev)
                 mask = mask.to(dev).unsqueeze(1)
 
-                x5d = spec.unsqueeze(2)
-                latent, _, _ = segmenter.encoder.forward_encoder(x5d, mask_ratio=0.0)
+                features = segmenter.encoder.forward_features(spec)
+                latent = features[-1]
                 expected_tokens = (spec.shape[2] // 14) * (spec.shape[3] // 14)
                 if latent.shape[1] > expected_tokens:
                     latent = latent[:, -expected_tokens:]
@@ -335,7 +401,10 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune Prithvi2 segmentation head")
-    parser.add_argument("--sites", nargs="+", required=True, help="Site directories (each with TARGETS/ and MASK/)")
+    parser.add_argument("--sites", nargs="+", required=True,
+                        help="Site directories (TARGETS/+MASK/) or prithvi2_dataset dir(s)")
+    parser.add_argument("--mode", choices=["sites", "prithvi2_dataset"], default="sites",
+                        help="Dataset mode: 'sites' for pipeline dirs, 'prithvi2_dataset' for built dataset")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument("--epochs", type=int, default=TRAIN_DEFAULTS["epochs"])
@@ -354,27 +423,49 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     # Build dataset
-    dataset = ShorelineSegDataset(
-        args.sites,
-        patch_size=args.patch_size,
-        overlap=args.overlap,
-        tiff_subdir=args.tiff_subdir,
-        mask_subdir=args.mask_subdir,
-    )
-
-    if len(dataset) == 0:
-        logger.error("No training patches found — check site directories.")
-        sys.exit(1)
-
-    # Split
-    n_val = max(1, int(len(dataset) * args.val_split))
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = random_split(dataset, [n_train, n_val])
+    if args.mode == "prithvi2_dataset":
+        # Pre-split dataset: load train and val separately
+        train_ds = ShorelineSegDataset(
+            args.sites,
+            patch_size=args.patch_size,
+            overlap=args.overlap,
+            mode="prithvi2_dataset",
+            split="train",
+        )
+        val_ds = ShorelineSegDataset(
+            args.sites,
+            patch_size=args.patch_size,
+            overlap=args.overlap,
+            mode="prithvi2_dataset",
+            split="val",
+        )
+        if len(train_ds) == 0:
+            logger.error("No training patches found — check dataset directory.")
+            sys.exit(1)
+        if len(val_ds) == 0:
+            logger.warning("No validation patches — using random split of train set.")
+            n_val = max(1, int(len(train_ds) * args.val_split))
+            n_train = len(train_ds) - n_val
+            train_ds, val_ds = random_split(train_ds, [n_train, n_val])
+    else:
+        dataset = ShorelineSegDataset(
+            args.sites,
+            patch_size=args.patch_size,
+            overlap=args.overlap,
+            tiff_subdir=args.tiff_subdir,
+            mask_subdir=args.mask_subdir,
+        )
+        if len(dataset) == 0:
+            logger.error("No training patches found — check site directories.")
+            sys.exit(1)
+        n_val = max(1, int(len(dataset) * args.val_split))
+        n_train = len(dataset) - n_val
+        train_ds, val_ds = random_split(dataset, [n_train, n_val])
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    logger.info("Train: %d patches  Val: %d patches", n_train, n_val)
+    logger.info("Train: %d patches  Val: %d patches", len(train_ds), len(val_ds))
 
     # Build model
     segmenter = load_segmenter(
