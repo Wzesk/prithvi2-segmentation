@@ -85,7 +85,8 @@ class SegmentationHead(nn.Module):
             ``(B, 1, target_h, target_w)`` logits.
         """
         B, N, D = tokens.shape
-        h, w = self.patch_token_h, self.patch_token_w
+        h = target_h // 14
+        w = target_w // 14
         x = tokens.transpose(1, 2).reshape(B, D, h, w)   # (B, D, h, w)
         x = self.proj(x)                                   # (B, 64, h, w)
         x = F.interpolate(x, size=(target_h, target_w), mode="bilinear", align_corners=False)
