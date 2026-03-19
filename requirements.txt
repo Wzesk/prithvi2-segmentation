@@ -1,0 +1,19 @@
+# Prithvi-EO 2.0 segmentation & cloud infill pipeline
+#
+# Core
+torch>=2.0
+numpy
+Pillow
+scipy
+rasterio
+
+# Model loading
+huggingface_hub
+terratorch>=0.5
+einops
+
+# Cloud detection (optional — falls back to brightness threshold)
+# omnicloudmask
+
+# Training
+# torchvision  (already part of PyTorch installs)
