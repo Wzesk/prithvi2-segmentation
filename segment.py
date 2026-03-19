@@ -297,24 +297,39 @@ class Prithvi2Seg:
             checkpoint, model_id=model_id, device=device,
         )
 
-    def mask_from_folder(self, folder: str) -> List[str]:
+    def mask_from_folder(self, folder: str, output_dir: Optional[str] = None) -> List[str]:
         """Generate binary masks for all GeoTIFFs in *folder*.
 
-        The output masks are saved in the sibling ``MASK/`` directory using
-        the pipeline naming convention ``{stem}_mask.png``.
+        The output masks are saved in the ``MASK/`` directory at the site
+        root (derived by walking up from the input folder past any sub-
+        directories under ``TARGETS/``).
 
         Parameters
         ----------
         folder : str
             Input directory containing ``*.tif`` files (e.g. the Prithvi2
             cloudless output, or ``TARGETS/`` directly).
+        output_dir : str or None
+            Explicit mask output directory.  When *None* the directory is
+            computed automatically.
 
         Returns
         -------
         list[str]
             Paths to the saved mask PNGs.
         """
-        mask_dir = os.path.join(os.path.dirname(folder.rstrip("/")), MASK_DIR)
+        if output_dir is not None:
+            mask_dir = output_dir
+        else:
+            # Walk up from the input folder to find the site root (parent of TARGETS)
+            parent = os.path.abspath(folder)
+            while True:
+                up = os.path.dirname(parent)
+                if os.path.basename(parent) == "TARGETS" or up == parent:
+                    break
+                parent = up
+            site_root = os.path.dirname(parent) if os.path.basename(parent) == "TARGETS" else os.path.dirname(folder.rstrip("/"))
+            mask_dir = os.path.join(site_root, MASK_DIR)
         os.makedirs(mask_dir, exist_ok=True)
 
         tiff_files = sorted(

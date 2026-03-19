@@ -84,10 +84,20 @@ def build_cloud_mask(
     try:
         import sys, importlib
         vpint = importlib.import_module("vpint_cloud_impute")
-        return vpint.build_cloud_mask(
+        mask = vpint.build_cloud_mask(
             data, include_shadow=include_shadow, device=device,
         )
-    except (ImportError, ModuleNotFoundError):
+        # Ensure mask matches image spatial dims (SEnSeIv2 may return a
+        # different resolution)
+        H, W = data.shape[1], data.shape[2]
+        if mask.shape != (H, W):
+            from PIL import Image as _Img
+            mask = np.array(
+                _Img.fromarray(mask).resize((W, H), _Img.NEAREST),
+                dtype=np.uint8,
+            )
+        return mask
+    except Exception:
         logger.warning(
             "SEnSeIv2 cloud detector not available; using brightness fallback."
         )
@@ -375,6 +385,10 @@ def infill_image(
     # Reassemble and denormalize
     full_rec = reassemble_patches(rec_patches, tile_info)
     full_rec = denormalize(full_rec)
+
+    # Crop back to original spatial dimensions (tiling may have padded)
+    orig_h, orig_w = prithvi_data.shape[1], prithvi_data.shape[2]
+    full_rec = full_rec[:, :orig_h, :orig_w]
 
     # Blend: keep original clear pixels, use reconstruction only where cloudy
     clear_mask = cloud_mask == 0
