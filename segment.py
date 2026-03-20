@@ -343,7 +343,9 @@ class Prithvi2Seg:
             # Remove _pred suffix (from cloud infill output) for clean naming
             if stem.endswith("_pred"):
                 stem = stem[:-5]
-            mask_path = os.path.join(mask_dir, f"{stem}_mask.png")
+            # Use _nir_mask.png naming to match downstream conventions
+            # (extract_boundary, refine_boundary, geo_transform all expect _nir_ prefix)
+            mask_path = os.path.join(mask_dir, f"{stem}_nir_mask.png")
 
             try:
                 binary = segment_tiff(src, self._segmenter, device=self.device)

@@ -7,17 +7,192 @@ is selected, the orchestrator skips the RGB/NIR creation, upsampling, and
 normalization steps and instead routes through:
 
     TARGETS/ (or coregistered/) → Prithvi2 cloud infill → Prithvi2 segment → MASK/
+
+It also generates the two downstream assets that the skipped steps would have
+produced:
+  - NORMALIZED/  — NDWI-blended NIR images (for boundary refinement)
+  - cloudless_report.csv — affine transform metadata (for geotransformation)
 """
 
+import csv
 import os
 import logging
 from typing import List, Optional
 
-from config import DEFAULT_MODEL_ID, DEFAULT_DEVICE, CLOUDLESS_DIR
+import numpy as np
+import rasterio
+from PIL import Image
+
+from config import (
+    DEFAULT_MODEL_ID, DEFAULT_DEVICE, CLOUDLESS_DIR,
+    TIFF_6BAND_ORDER, TIFF_7BAND_ORDER,
+)
 from cloud_infill import batch_cloud_infill
 from segment import Prithvi2Seg
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Standalone helpers for downstream asset generation
+# ---------------------------------------------------------------------------
+
+def _compute_ndwi(green: np.ndarray, nir: np.ndarray) -> np.ndarray:
+    """NDWI = (Green - NIR) / (Green + NIR) × -1  (land bright, water dark).
+
+    Mirrors ``planetary_s2.compute_ndwi`` so the images look identical.
+    """
+    eps = 1e-6
+    return (green - nir) / (green + nir + eps) * -1
+
+
+def generate_ndwi_images(
+    tiff_folder: str,
+    output_folder: str,
+) -> List[str]:
+    """Create NDWI-blended NIR PNGs from multispectral TIFFs.
+
+    Replicates the NIR image the normal pipeline puts into
+    ``NORMALIZED/{stem}_nir_up.png`` so that boundary refinement can
+    sample pixel values along transect normals.
+
+    Parameters
+    ----------
+    tiff_folder : str
+        Folder containing the 6- or 7-band GeoTIFFs (``TARGETS/``
+        or the Prithvi2 cloudless sub-folder).
+    output_folder : str
+        Destination directory (typically ``NORMALIZED/``).
+
+    Returns
+    -------
+    list[str]
+        Paths to the saved PNG files.
+    """
+    os.makedirs(output_folder, exist_ok=True)
+    tiffs = sorted(
+        f for f in os.listdir(tiff_folder) if f.lower().endswith((".tif", ".tiff"))
+    )
+    saved: List[str] = []
+
+    for fname in tiffs:
+        src_path = os.path.join(tiff_folder, fname)
+        stem = os.path.splitext(fname)[0]
+        if stem.endswith("_pred"):
+            stem = stem[:-5]
+
+        try:
+            with rasterio.open(src_path) as src:
+                n_bands = src.count
+                bands = src.read()  # (C, H, W)
+
+            # Determine Green and NIR band positions
+            if n_bands >= 7:
+                band_order = TIFF_7BAND_ORDER
+            else:
+                band_order = TIFF_6BAND_ORDER
+
+            green_idx = band_order.index("B03")
+            # Prefer B08 (10 m NIR) if present, fall back to B8A
+            nir_idx = (
+                band_order.index("B08")
+                if "B08" in band_order
+                else band_order.index("B8A")
+            )
+
+            green = bands[green_idx].astype(np.float32)
+            real_nir = bands[nir_idx].astype(np.float32)
+
+            ndwi = _compute_ndwi(green, real_nir)
+            blended = (real_nir + ndwi) / 2.0
+            bmax = np.max(blended)
+            normed = (
+                (blended / bmax * 255).astype(np.uint8)
+                if bmax > 0
+                else blended.astype(np.uint8)
+            )
+
+            img = Image.fromarray(np.dstack([normed, normed, normed]))
+            out_path = os.path.join(output_folder, f"{stem}_nir_up.png")
+            img.save(out_path)
+            saved.append(out_path)
+        except Exception as exc:
+            logger.error("NDWI generation failed for %s: %s", fname, exc)
+
+    logger.info("Generated %d NDWI images in %s", len(saved), output_folder)
+    return saved
+
+
+def generate_cloudless_report(
+    tiff_folder: str,
+    output_path: str,
+) -> str:
+    """Write a ``cloudless_report.csv`` from the GeoTIFFs in *tiff_folder*.
+
+    This file is consumed by ``geo_transform.batch_geotransform`` which reads
+    ``image_Transform`` to map pixel coordinates to geographic coordinates.
+
+    Parameters
+    ----------
+    tiff_folder : str
+        Folder containing GeoTIFFs (``TARGETS/`` or cloudless sub-folder).
+    output_path : str
+        Full path for the output CSV (e.g.
+        ``TARGETS/cloudless/cloudless_report.csv``).
+
+    Returns
+    -------
+    str
+        *output_path* — the written file.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    tiffs = sorted(
+        f for f in os.listdir(tiff_folder) if f.lower().endswith((".tif", ".tiff"))
+    )
+
+    header = [
+        "image_name",
+        "image_date",
+        "cloud_coverage %",
+        "original_image_size",
+        "cloudless_image_size",
+        "image_CRS",
+        "image_Transform",
+        "band_names",
+    ]
+
+    rows: list = []
+    for fname in tiffs:
+        src_path = os.path.join(tiff_folder, fname)
+        stem = os.path.splitext(fname)[0]
+        if stem.endswith("_pred"):
+            stem = stem[:-5]
+        try:
+            with rasterio.open(src_path) as src:
+                # Use HxW format to match vpint_cloud_impute convention
+                # (geo_transform.get_first_transform compares against
+                #  rasterio .shape which returns (H, W))
+                rows.append([
+                    stem,
+                    stem[:8] if len(stem) >= 8 else stem,
+                    0.0,
+                    f"{src.height}x{src.width}",
+                    f"{src.height}x{src.width}",
+                    str(src.crs),
+                    str(src.transform),
+                    str(list(src.descriptions) if src.descriptions[0] else
+                        [f"B{i+1}" for i in range(src.count)]),
+                ])
+        except Exception as exc:
+            logger.error("Could not read metadata from %s: %s", fname, exc)
+
+    with open(output_path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+    logger.info("Wrote cloudless_report.csv with %d entries → %s", len(rows), output_path)
+    return output_path
 
 
 class Prithvi2Pipeline:
